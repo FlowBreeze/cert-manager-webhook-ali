@@ -3,6 +3,7 @@ package alidns
 import (
 	"context"
 	"fmt"
+	"github.com/flowbreeze/cert-manager-webhook-ali/pkg/util/k8s"
 	"strings"
 
 	"github.com/aliyun/alibaba-cloud-sdk-go/sdk/auth/credentials"
@@ -24,9 +25,40 @@ func NewSolver() webhook.Solver {
 // Solver implements the provider-specific logic needed to
 // 'present' an ACME challenge TXT record for your own DNS provider.
 // To do so, it must implement the `github.com/jetstack/cert-manager/pkg/acme/webhook.Solver`
-// interface.
+var _ webhook.Solver = &Solver{}
+
 type Solver struct {
-	client *kubernetes.Clientset
+	client            *kubernetes.Clientset
+	resourceNamespace string
+}
+
+// Initialize will be called when the webhook first starts.
+// This method can be used to instantiate the webhook, i.e. initialising
+// connections or warming up caches.
+//
+// Typically, the kubeClientConfig parameter is used to build a Kubernetes
+// client that can be used to fetch resources from the Kubernetes API, e.g.
+// Secret resources containing credentials used to authenticate with DNS
+// provider accounts.
+//
+// The stopCh can be used to handle early termination of the webhook, in cases
+// where a SIGTERM or similar signal is sent to the webhook process.
+func (s *Solver) Initialize(kubeClientConfig *rest.Config, stopCh <-chan struct{}) error {
+	cl, err := kubernetes.NewForConfig(kubeClientConfig)
+	if err != nil {
+		return err
+	}
+	namespace, err := k8s.CurrentNamespace()
+	if err != nil {
+		klog.Errorf("cannot get current namespace, use default namespace instead: %v", err)
+		s.resourceNamespace = "default"
+	} else {
+		s.resourceNamespace = namespace
+		klog.Infof("will read resource in namespace: %s", namespace)
+	}
+
+	s.client = cl
+	return nil
 }
 
 // Name is used as the name for this DNS solver when referencing it on the ACME
@@ -36,7 +68,7 @@ type Solver struct {
 // within a single webhook deployment**.
 // For example, `cloudflare` may be used as the name of a solver.
 func (s *Solver) Name() string {
-	return "alidns"
+	return "ali"
 }
 
 // Present is responsible for actually presenting the DNS record with the
@@ -45,7 +77,7 @@ func (s *Solver) Name() string {
 // cert-manager itself will later perform a self check to ensure that the
 // solver has correctly configured the DNS provider.
 func (s *Solver) Present(ch *v1alpha1.ChallengeRequest) error {
-	klog.Infof("Presenting txt record: %v %v", ch.ResolvedFQDN, ch.ResolvedZone)
+	klog.Infof("Start set txt record: %v %v", ch.ResolvedFQDN, ch.ResolvedZone)
 	client, err := s.newClientFromChallenge(ch)
 	if err != nil {
 		klog.Errorf("New client from challenge error: %v", err)
@@ -64,7 +96,47 @@ func (s *Solver) Present(ch *v1alpha1.ChallengeRequest) error {
 		return err
 	}
 
-	klog.Infof("Presented txt record %v", ch.ResolvedFQDN)
+	klog.Infof("Set txt record %v to remote[%v]", ch.ResolvedFQDN, ch.Key)
+	return nil
+}
+
+// CleanUp should delete the relevant TXT record from the DNS provider console.
+// If multiple TXT records exist with the same record name (e.g.
+// _acme-challenge.example.com) then **only** the record with the same `key`
+// value provided on the ChallengeRequest should be cleaned up.
+// This is in order to facilitate multiple DNS validations for the same domain
+// concurrently.
+func (s *Solver) CleanUp(ch *v1alpha1.ChallengeRequest) error {
+	klog.Infof("Start Clean up txt record: %v %v", ch.ResolvedFQDN, ch.ResolvedZone)
+	client, err := s.newClientFromChallenge(ch)
+	if err != nil {
+		klog.Errorf("New client from challenge error: %v", err)
+		return err
+	}
+
+	zoneName, err := client.getHostedZone(ch.ResolvedZone)
+	if err != nil {
+		klog.Errorf("Get hosted zone %v error: %v", ch.ResolvedZone, err)
+		return err
+	}
+
+	rr := extractRR(ch.ResolvedFQDN, zoneName)
+	record, err := client.getTxtRecord(zoneName, rr)
+	if err != nil {
+		klog.Errorf("Get text record %v.%v error: %v", rr, zoneName, err)
+		return err
+	}
+
+	if record.Value != ch.Key {
+		klog.Infof("Records value does not match local[%v] remote[%v]: %v", ch.Key, record.Value, ch.ResolvedFQDN)
+	}
+
+	if err := client.deleteDomainRecord(record.RecordId); err != nil {
+		klog.Errorf("Delete domain record %v error: %v", ch.ResolvedFQDN, err)
+		return err
+	}
+
+	klog.Infof("Clean up txt record: %v %v", ch.ResolvedFQDN, ch.ResolvedZone)
 	return nil
 }
 
@@ -76,7 +148,7 @@ func (s *Solver) newClientFromChallenge(ch *v1alpha1.ChallengeRequest) (*Client,
 
 	klog.Infof("Decoded config: %v", cfg)
 
-	cred, err := s.getCredential(&cfg, ch.ResourceNamespace)
+	cred, err := s.getCredential(&cfg, s.resourceNamespace)
 	if err != nil {
 		return nil, fmt.Errorf("get credential error: %v", err)
 	}
@@ -104,9 +176,9 @@ func (s *Solver) getCredential(cfg *Config, ns string) (*credentials.AccessKeyCr
 }
 
 func (s *Solver) getSecretData(selector cmmetav1.SecretKeySelector, ns string) ([]byte, error) {
-	secret, err := s.client.CoreV1().Secrets(ns).Get(context.TODO(),selector.Name, metav1.GetOptions{})
+	secret, err := s.client.CoreV1().Secrets(ns).Get(context.TODO(), selector.Name, metav1.GetOptions{})
 	if err != nil {
-		return nil, errors.Wrapf(err, "failed to load secret %q", ns+"/"+selector.Name)
+		return nil, errors.Wrapf(err, "failed to load secret [%q] at namespace [%q]", selector.Name, ns)
 	}
 
 	if data, ok := secret.Data[selector.Key]; ok {
@@ -114,68 +186,6 @@ func (s *Solver) getSecretData(selector cmmetav1.SecretKeySelector, ns string) (
 	}
 
 	return nil, errors.Errorf("no key %q in secret %q", selector.Key, ns+"/"+selector.Name)
-}
-
-// CleanUp should delete the relevant TXT record from the DNS provider console.
-// If multiple TXT records exist with the same record name (e.g.
-// _acme-challenge.example.com) then **only** the record with the same `key`
-// value provided on the ChallengeRequest should be cleaned up.
-// This is in order to facilitate multiple DNS validations for the same domain
-// concurrently.
-func (s *Solver) CleanUp(ch *v1alpha1.ChallengeRequest) error {
-	klog.Infof("Cleaning up txt record: %v %v", ch.ResolvedFQDN, ch.ResolvedZone)
-	client, err := s.newClientFromChallenge(ch)
-	if err != nil {
-		klog.Errorf("New client from challenge error: %v", err)
-		return err
-	}
-
-	zoneName, err := client.getHostedZone(ch.ResolvedZone)
-	if err != nil {
-		klog.Errorf("Get hosted zone %v error: %v", ch.ResolvedZone, err)
-		return err
-	}
-
-	rr := extractRR(ch.ResolvedFQDN, zoneName)
-	record, err := client.getTxtRecord(zoneName, rr)
-	if err != nil {
-		klog.Errorf("Get text record %v.%v error: %v", rr, zoneName, err)
-		return err
-	}
-
-	if record.Value != ch.Key {
-		klog.Errorf("Records value does not match: %v", ch.ResolvedFQDN)
-		return errors.New("record value does not match")
-	}
-
-	if err := client.deleteDomainRecord(record.RecordId); err != nil {
-		klog.Errorf("Delete domain record %v error: %v", ch.ResolvedFQDN, err)
-		return err
-	}
-
-	klog.Infof("Cleaned up txt record: %v %v", ch.ResolvedFQDN, ch.ResolvedZone)
-	return nil
-}
-
-// Initialize will be called when the webhook first starts.
-// This method can be used to instantiate the webhook, i.e. initialising
-// connections or warming up caches.
-//
-// Typically, the kubeClientConfig parameter is used to build a Kubernetes
-// client that can be used to fetch resources from the Kubernetes API, e.g.
-// Secret resources containing credentials used to authenticate with DNS
-// provider accounts.
-//
-// The stopCh can be used to handle early termination of the webhook, in cases
-// where a SIGTERM or similar signal is sent to the webhook process.
-func (s *Solver) Initialize(kubeClientConfig *rest.Config, stopCh <-chan struct{}) error {
-	cl, err := kubernetes.NewForConfig(kubeClientConfig)
-	if err != nil {
-		return err
-	}
-
-	s.client = cl
-	return nil
 }
 
 func extractRR(fqdn, domain string) string {

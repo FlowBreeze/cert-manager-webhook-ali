@@ -1,11 +1,11 @@
 package main
 
 import (
+	"github.com/flowbreeze/cert-manager-webhook-ali/pkg/alidns"
 	"os"
 	"testing"
 
 	"github.com/jetstack/cert-manager/test/acme/dns"
-	"github.com/pragkent/alidns-webhook/alidns"
 )
 
 var (
